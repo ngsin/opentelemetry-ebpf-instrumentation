@@ -1,7 +1,7 @@
 # eBPF 学习进度追踪
 
 > 开始日期: 2026-03-31
-> 最后更新: 2026-04-01 (Week2 Day7 完成, Week2 全部完成)
+> 最后更新: 2026-04-01 (Week3 Day1 完成)
 
 ## 进度总览
 
@@ -9,7 +9,7 @@
 |------|------|------|---------|---------|------|
 | Week 1 | C 语言速成 | `已完成` | 2026-03-31 | 2026-03-31 | 7天全部完成 |
 | Week 2 | eBPF 基础 + Hello World | `已完成` | 2026-03-31 | 2026-04-01 | 7天全部完成,成功编译运行eBPF程序 |
-| Week 3 | eBPF Maps | `未开始` | - | - | |
+| Week 3 | eBPF Maps | `进行中` | 2026-04-01 | - | |
 | Week 4 | Kprobes | `未开始` | - | - | |
 | Week 5 | Uprobes | `未开始` | - | - | |
 | Week 6 | 网络追踪 TC/XDP | `未开始` | - | - | |
@@ -74,7 +74,7 @@
 
 | Day | 主题 | Demo 文件 | 状态 | 日期 | 笔记/收获 |
 |-----|------|----------|------|------|----------|
-| 1 | HashMap: 进程系统调用计数 | `day1/syscall_counter.bpf.c` | `未开始` | - | |
+| 1 | HashMap: 进程系统调用计数 | `day1/syscall_counter.bpf.c` | `已完成` | 2026-04-01 | BPF_MAP_TYPE_HASH定义:key/value类型+max_entries; 操作三件套:lookup→检查NULL→update; 原子操作__sync_fetch_and_add vs直接+=(OBI在flows.c选择后者因统计丢几个无所谓); Pinning:OBI_PIN_INTERNAL=100让8个eBPF程序共享pid_cache/valid_pids,通过/sys/fs/bpf/路径指向同一Map对象 |
 | 2 | RingBuffer: 事件上报 | `day2/event_ringbuf.bpf.c` | `未开始` | - | |
 | 3 | 阅读 OBI Maps 目录 | `day3/obi_maps_study.c` | `未开始` | - | |
 | 4 | 深入 OBI ringbuf.h | `day4/ringbuf_deep_dive.c` | `未开始` | - | |
