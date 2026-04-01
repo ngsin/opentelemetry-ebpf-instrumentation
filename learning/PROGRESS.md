@@ -1,7 +1,7 @@
 # eBPF 学习进度追踪
 
 > 开始日期: 2026-03-31
-> 最后更新: 2026-04-01 (Week3 Day1 完成)
+> 最后更新: 2026-04-01 (Week3 Day2 完成)
 
 ## 进度总览
 
@@ -75,7 +75,7 @@
 | Day | 主题 | Demo 文件 | 状态 | 日期 | 笔记/收获 |
 |-----|------|----------|------|------|----------|
 | 1 | HashMap: 进程系统调用计数 | `day1/syscall_counter.bpf.c` | `已完成` | 2026-04-01 | BPF_MAP_TYPE_HASH定义:key/value类型+max_entries; 操作三件套:lookup→检查NULL→update; 原子操作__sync_fetch_and_add vs直接+=(OBI在flows.c选择后者因统计丢几个无所谓); Pinning:OBI_PIN_INTERNAL=100让8个eBPF程序共享pid_cache/valid_pids,通过/sys/fs/bpf/路径指向同一Map对象 |
-| 2 | RingBuffer: 事件上报 | `day2/event_ringbuf.bpf.c` | `未开始` | - | |
+| 2 | RingBuffer: 事件上报 | `day2/event_ringbuf.bpf.c` | `已完成` | 2026-04-01 | RingBuffer是内核→用户态单向通道(类比Go channel); reserve锁定空间→填数据→submit解锁标记可读/discard解锁释放; 多CPU共享需要锁(vs PerfBuffer每CPU独立); submit做两件事:清busy bit+写eventfd唤醒Go epoll; OBI的get_flags()攒批优化:bpf_ringbuf_query查未读数据量,够阈值才FORCE_WAKEUP; RESERVE+SUBMIT零拷贝 vs ALLOC+SEND拷贝路径(安全不怕漏discard); const局部变量是编译约束防手滑不影响运行 |
 | 3 | 阅读 OBI Maps 目录 | `day3/obi_maps_study.c` | `未开始` | - | |
 | 4 | 深入 OBI ringbuf.h | `day4/ringbuf_deep_dive.c` | `未开始` | - | |
 | 5 | Per-CPU Map | `day5/percpu_counter.bpf.c` | `未开始` | - | |
