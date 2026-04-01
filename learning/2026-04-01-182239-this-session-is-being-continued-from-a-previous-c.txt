@@ -1,0 +1,287 @@
+ ▐▛███▜▌   Claude Code v2.1.89
+▝▜█████▛▘  Sonnet 4.6 · API Usage Billing
+  ▘▘ ▝▝    ~/…/.claude/worktrees/elegant-churning-sunset
+
+❯ 为什么要使用const， 这里不是需要频繁调用判断吗                                
+
+● 好问题！const 不是说"这个值永远不变"，而是说
+  这个变量在它的生命周期内不会被修改。
+
+  关键：sz 的生命周期
+
+  static __always_inline long get_flags() {
+      if (!wakeup_data_bytes) return 0;
+
+      const u64 sz = bpf_ringbuf_query(&events, BPF_RB_AVAIL_DATA);  // 查一次
+      return sz >= wakeup_data_bytes ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
+      // ↑ 用一次，函数就结束了，sz 销毁
+  }
+
+  sz 是函数内的局部变量，每次调用 get_flags() 都会：
+
+  第 1 次调用 get_flags():
+    sz = bpf_ringbuf_query(...)  → sz = 100   → 比较 → 返回 → sz 销毁
+
+  第 2 次调用 get_flags():
+    sz = bpf_ringbuf_query(...)  → sz = 200   → 比较 → 返回 → sz 销毁
+
+  第 3 次调用 get_flags():
+    sz = bpf_ringbuf_query(...)  → sz = 4100  → 比较 → 返回 → sz 销毁
+
+  每次调用都重新查询，拿到最新值。 const 只是说"拿到之后，在这次调用内不会去改
+  sz"。
+
+  const 的作用：防止意外修改
+
+  // 有 const:
+  const u64 sz = bpf_ringbuf_query(&events, BPF_RB_AVAIL_DATA);
+  sz = 999;  // ❌ 编译报错！不允许修改
+
+  // 没 const:
+  u64 sz = bpf_ringbuf_query(&events, BPF_RB_AVAIL_DATA);
+  sz = 999;  // ✓ 编译通过，但这是 bug——你改了查询结果
+
+  就是一种编程习惯：如果一个变量赋值后不需要改，加 const
+  告诉编译器和读代码的人"这个值不该被修改"。
+
+  类比 Go：
+
+  // Go 没有 const 局部变量，但理念相同
+  func getFlags() int {
+      sz := ringbufQuery()  // 每次调用都重新查
+      // 你不会写 sz = 999，虽然语法允许
+      if sz >= wakeupThreshold {
+          return FORCE_WAKEUP
+      }
+      return NO_WAKEUP
+  }
+
+  Go 里没法给局部变量加 const，但 C 可以，OBI 就用了。
+
+  总结
+
+  ┌──────────────────┬──────────────┬──────────┐
+  │                  │ const u64 sz │  u64 sz  │
+  ├──────────────────┼──────────────┼──────────┤
+  │ 每次调用重新查询 │ ✅ 是        │ ✅ 是    │
+  ├──────────────────┼──────────────┼──────────┤
+  │ 函数内能修改     │ ❌ 不能      │ ✅ 能    │
+  ├──────────────────┼──────────────┼──────────┤
+  │ 实际运行效果     │ 完全一样     │ 完全一样 │
+  ├──────────────────┼──────────────┼──────────┤
+  │ 代码安全性       │ 更好，防手滑 │ 差一点   │
+  └──────────────────┴──────────────┴──────────┘
+
+  const 是给编译器和人看的约束，不影响运行逻辑。
+
+  还有问题吗？没有的话 Day 2 完成，继续 Day 3。
+
+❯ 继续                                                                          
+
+● Day 2 完成，记录进度并 commit。
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(learning/PROGRESS.md)
+  ⎿  Added 1 line, removed 1 line
+      1  # eBPF 学习进度追踪
+      2  
+      3  > 开始日期: 2026-03-31
+      4 -> 最后更新: 2026-04-01 (Week3 Day1 完成)                        
+      4 +> 最后更新: 2026-04-01 (Week3 Day2 完成)                        
+      5  
+      6  ## 进度总览
+      7  
+
+● Update(learning/PROGRESS.md)
+  ⎿  Added 1 line, removed 1 line
+      75  | Day | 主题 | Demo 文件 | 状态 | 日期 | 笔记/收获 |
+      76  |-----|------|----------|------|------|----------|
+      77  | 1 | HashMap: 进程系统调用计数 | `day1/syscall_counter.bpf.c` 
+          | `已完成` | 2026-04-01 | BPF_MAP_TYPE_HASH定义:key/value类型+m
+          ax_entries; 操作三件套:lookup→检查NULL→update; 原子操作__sync_f
+          etch_and_add vs直接+=(OBI在flows.c选择后者因统计丢几个无所谓); 
+          Pinning:OBI_PIN_INTERNAL=100让8个eBPF程序共享pid_cache/valid_pi
+          ds,通过/sys/fs/bpf/路径指向同一Map对象 |
+      78 -| 2 | RingBuffer: 事件上报 | `day2/event_ringbuf.bpf.c` | `未开
+         -始` | - | |                                                    
+      78 +| 2 | RingBuffer: 事件上报 | `day2/event_ringbuf.bpf.c` | `已完
+         +成` | 2026-04-01 | RingBuffer是内核→用户态单向通道(类比Go chann
+         +el); reserve锁定空间→填数据→submit解锁标记可读/discard解锁释放;
+         + 多CPU共享需要锁(vs PerfBuffer每CPU独立); submit做两件事:清busy
+         + bit+写eventfd唤醒Go epoll; OBI的get_flags()攒批优化:bpf_ringbu
+         +f_query查未读数据量,够阈值才FORCE_WAKEUP; RESERVE+SUBMIT零拷贝 
+         +vs ALLOC+SEND拷贝路径(安全不怕漏discard); const局部变量是编译约
+         +束防手滑不影响运行 |                                           
+      79  | 3 | 阅读 OBI Maps 目录 | `day3/obi_maps_study.c` | `未开始` |
+           - | |
+      80  | 4 | 深入 OBI ringbuf.h | `day4/ringbuf_deep_dive.c` | `未开始
+          ` | - | |
+      81  | 5 | Per-CPU Map | `day5/percpu_counter.bpf.c` | `未开始` | - 
+          | |
+
+● Bash(git add learning/PROGRESS.md && git commit -m "$(cat <<'EOF'
+      learning: complete Week 3 Day 2 (RingBuffer, wakeup optimization)…)
+  ⎿  [worktree-elegant-churning-sunset efb1dbb5b] learning: complete Week 3
+      Day 2 (RingBuffer, wakeup optimization)
+      1 file changed, 2 insertions(+), 2 deletions(-)
+
+● ✅ Day 2 已记录并 commit。
+
+  ---
+  Week 3 Day 3: 阅读 OBI Maps 目录
+
+  Read 1 file (ctrl+o to expand)
+
+● 今天是代码阅读日，带你系统性地看 OBI 的 Map 架构。先看实际文件验证 demo
+  中的描述：
+
+  Read 4 files, listed 1 directory (ctrl+o to expand)
+
+● 再看几个关键的特殊 Map：
+
+  Read 4 files (ctrl+o to expand)
+
+● 好，现在全部看完了。来系统讲解：
+
+  Week 3 Day 3: OBI Maps 目录 — 全景地图
+
+  OBI 有 30 个 Map 文件，看起来很多，但它们按功能分成 5 类，每类的模式都一样。
+
+  🗺️ 全景图：一个 HTTP 请求经过的 Map
+
+  客户端发起请求 ──→ 服务端接收 ──→ 处理 ──→ 响应 ──→ OBI 上报
+
+  OBI 在每个阶段用不同 Map 记录信息:
+
+    ① connect/accept 阶段
+    ┌─────────────────────────────────┐
+    │ fd_map:        连接 → FD+PID    │  "谁在处理这个连接"
+    │ fd_to_connection: FD → 连接     │  "这个 FD 对应什么连接"  (反向查找)
+    │ accepted_connections: 连接→时间  │  "服务端什么时候接受的"
+    │ sock_pids:     连接 → PID       │  "socket 属于哪个进程"
+    └─────────────────────────────────┘
+                ↓
+    ② SSL 握手阶段 (如果是 HTTPS)
+    ┌─────────────────────────────────┐
+    │ ssl_to_conn:   SSL指针 → 连接   │  "SSL_read 时查出对应连接"
+    │ active_ssl_connections: 连接→SSL│  "反向查找"
+    │ active_ssl_read_args:  暂存参数 │  "ssl_read 入口→出口传参"
+    │ active_ssl_write_args: 暂存参数 │  "ssl_write 入口→出口传参"
+    └─────────────────────────────────┘
+                ↓
+    ③ HTTP 请求/响应阶段
+    ┌─────────────────────────────────┐
+    │ ongoing_http:  PID+连接 → HTTP  │  "正在处理的 HTTP 请求"
+    │ ongoing_http2_connections: HTTP2│  "HTTP/2 多路复用状态"
+    │ ongoing_tcp_req: TCP 层跟踪     │
+    └─────────────────────────────────┘
+                ↓
+    ④ 分布式追踪阶段
+    ┌─────────────────────────────────┐
+    │ trace_map:     连接 → traceID   │  "这个连接属于哪个 trace"
+    │ server_traces: PID → traceID    │  "服务端的 trace 信息"
+    │ incoming_trace_map: 入站 trace   │
+    │ outgoing_trace_map: 出站 trace   │
+    └─────────────────────────────────┘
+                ↓
+    ⑤ 上报
+    ┌─────────────────────────────────┐
+    │ events (RingBuffer): → Go 读取   │  "最终事件发给用户态"
+    └─────────────────────────────────┘
+
+  五大设计模式
+
+  模式 1：LRU_HASH 是默认选择
+
+  // 30 个 Map 中，绝大部分是 LRU_HASH
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+
+  为什么？LRU = Least Recently Used，自动淘汰最久没用的条目。
+  - 连接断了不需要手动清理
+  - Map 满了不会报错，自动踢掉旧数据
+  - 类比 Go：map + 定时清理 ≈ LRU_HASH 自动做了
+
+  模式 2：标准化大小
+
+  // bpf/common/map_sizing.h
+  #define MAX_CONCURRENT_REQUESTS         10000   // 单进程级别
+  #define MAX_CONCURRENT_SHARED_REQUESTS  30000   // 跨进程共享 (pinned)
+
+  pinned Map 用 30000（多个程序共享，需要更大），非 pinned 用 10000。
+
+  模式 3：双向映射（正反查找）
+
+  fd_map:              连接信息 → FD      "知道连接，查 FD"
+  fd_to_connection:    FD → 连接信息      "知道 FD，查连接"
+
+  ssl_to_conn:              SSL* → 连接   "知道 SSL 指针，查连接"
+  active_ssl_connections:   连接 → SSL*   "知道连接，查 SSL 指针"
+
+  为什么需要两份？不同的 hook 点拿到的信息不同：
+  - sys_connect 知道连接信息，要查 FD → 用 fd_map
+  - sys_write(fd, ...) 知道 FD，要查连接 → 用 fd_to_connection
+
+  模式 4：Scratch Memory（绕过 512 字节栈限制）
+
+  // bpf/common/scratch_mem.h
+  #define SCRATCH_MEM_TYPED(NAME, TYPE)                          \
+      struct {                                                    \
+          __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);               \
+          __uint(key_size, sizeof(u32));                         \
+          __uint(value_size, sizeof(TYPE));                      \
+          __uint(max_entries, 1);   // ← 只有 1 个条目!          \
+      } NAME##_storage SEC(".maps");
+
+  // 使用: tp_info_mem.h
+  SCRATCH_MEM_TYPED(tp_info, tp_info_pid_t);
+  // 展开后: 创建一个 PERCPU_ARRAY Map，每个 CPU 有一个 tp_info_pid_t 大小的空间
+
+  栈 (512 字节限制):
+  ┌──────────┐
+  │ 放不下大  │  ← tp_info_pid_t 可能超过 100 字节
+  │ 结构体!   │     加上其他局部变量就爆了
+  └──────────┘
+
+  Scratch Memory (Per-CPU Array):
+    CPU 0 → [tp_info_pid_t 大小的空间]  ← 从这里借空间用
+    CPU 1 → [tp_info_pid_t 大小的空间]     每个 CPU 独立，不冲突
+    CPU 2 → [tp_info_pid_t 大小的空间]
+
+  max_entries = 1 + PERCPU_ARRAY = 每个 CPU 只有一个临时空间，用完即弃，就是个
+  临时工作台。
+
+  模式 5：kprobe 入口/出口传参
+
+  // active_ssl_read_args.h — SSL 读操作参数暂存
+  // Key: pid_tid
+  // Value: ssl_read 的参数 (buffer 指针、大小等)
+
+  // 流程:
+  // ssl_read 入口 (kprobe):  保存参数到 Map
+  // ssl_read 出口 (kretprobe): 从 Map 取出参数 + 读取返回值
+
+  ssl_read(ssl, buf, len)
+      │
+      ├── kprobe 入口: args_map[pid_tid] = {buf, len}    // 存参数
+      │
+      │   ... ssl_read 执行 ...
+      │
+      └── kretprobe 出口: args = args_map[pid_tid]       // 取参数
+                          ret_val = PT_REGS_RC(ctx)       // 取返回值
+                          // 现在有了 buf + len + 实际读了多少字节
+
+  为什么？kretprobe 只能拿到返回值，拿不到入参。所以入口存 Map，出口取 Map。
+
+  总结：OBI 的 Map 就是一个 "内核态数据库"
+
+  类比关系数据库:
+    fd_map           ≈ connections 表
+    ongoing_http     ≈ http_requests 表
+    trace_map        ≈ traces 表
+    events (ringbuf) ≈ 消息队列 (往外发)
+    scratch memory   ≈ 临时表 / 工作区
+
+  有问题吗？没有的话 Day 3 完成，继续 Day 4。
+
+✻ Crunched for 1m 46s
