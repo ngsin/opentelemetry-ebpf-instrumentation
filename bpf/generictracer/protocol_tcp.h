@@ -71,6 +71,20 @@ tcp_get_or_set_trace_info(tcp_req_t *req, pid_connection_info_t *pid_conn, u8 ss
             init_new_trace(&req->tp);
         }
 
+        // For SSL client: check if C++ agent curl hook pre-wrote span_id
+        // into traces_ctx_v1 so traceparent header's parent-id matches
+        // this eBPF client span's span_id.
+        // Key: (host_pid << 32) | host_pid = bpf_get_current_pid_tgid()
+        // for the main thread.
+        if (ssl) {
+            const u64 cur_pid_tgid = bpf_get_current_pid_tgid();
+            obi_ctx_info_t *agent_ctx = obi_ctx__get(cur_pid_tgid);
+            if (agent_ctx && *((u64 *)agent_ctx->span_id) != 0) {
+                bpf_dbg_printk("TCP: Reusing curl hook span_id from traces_ctx_v1");
+                __builtin_memcpy(req->tp.span_id, agent_ctx->span_id, SPAN_ID_SIZE_BYTES);
+            }
+        }
+
         set_tcp_trace_info(
             TRACE_TYPE_CLIENT, &pid_conn->conn, &req->tp, pid_conn->pid, ssl, orig_dport);
     } else { // Server
@@ -263,7 +277,40 @@ static __always_inline void handle_unknown_tcp_connection(pid_connection_info_t 
             existing->end_monotime_ns = bpf_ktime_get_ns();
             existing->resp_len = bytes_len;
             existing->is_server = is_server;
-            tcp_req_t *trace = bpf_ringbuf_reserve(&events, sizeof(tcp_req_t), 0);
+            // Late-binding trace context: the C++ agent may have written
+            // parsed traceparent from HTTPS headers into incoming_trace_map
+            // AFTER the initial trace lookup (which runs on sock_recvmsg
+            // kretprobe — before SSL_read returns to the agent hook).
+            // Check now and override the trace context if found.
+            tp_info_pid_t *late_tp =
+                bpf_map_lookup_elem(&incoming_trace_map, &pid_conn->conn);
+            if (late_tp && late_tp->valid) {
+                bpf_dbg_printk("Late-binding trace context from incoming_trace_map");
+                __builtin_memcpy(
+                    existing->tp.trace_id, late_tp->tp.trace_id, sizeof(existing->tp.trace_id));
+                __builtin_memcpy(
+                    existing->tp.parent_id, late_tp->tp.span_id, sizeof(existing->tp.parent_id));
+                urand_bytes(existing->tp.span_id, SPAN_ID_SIZE_BYTES);
+                bpf_map_delete_elem(&incoming_trace_map, &pid_conn->conn);
+
+                // Propagate corrected traceID to server_traces so that
+                // subsequent child spans (e.g. Redis) on the same thread
+                // inherit the correct traceID via find_parent_trace().
+                trace_key_t lb_t_key = {0};
+                trace_key_from_pid_tid(&lb_t_key);
+                tp_info_pid_t *srv_tp = bpf_map_lookup_elem(&server_traces, &lb_t_key);
+                if (srv_tp) {
+                    __builtin_memcpy(srv_tp->tp.trace_id, late_tp->tp.trace_id, sizeof(srv_tp->tp.trace_id));
+                    __builtin_memcpy(srv_tp->tp.span_id, existing->tp.span_id, sizeof(srv_tp->tp.span_id));
+                    bpf_dbg_printk("Late-binding: updated server_traces for child span propagation");
+                }
+
+                // Also update traces_ctx_v1 for C++ agent curl hook.
+                const u64 lb_id = bpf_get_current_pid_tgid();
+                obi_ctx__set(lb_id, &existing->tp);
+            }
+
+            tcp_req_t *trace = empty_tcp_req();
             if (trace) {
                 bpf_dbg_printk("Sending TCP trace: existing=%lx, resp_length=%d",
                                existing,

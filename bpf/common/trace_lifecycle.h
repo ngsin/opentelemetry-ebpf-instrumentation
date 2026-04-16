@@ -13,20 +13,34 @@
 #include <maps/cp_support_connect_info.h>
 #include <maps/incoming_trace_map.h>
 #include <maps/outgoing_trace_map.h>
+#include <maps/server_trace_conn.h>
 #include <maps/server_traces.h>
 
+#include <pid/pid_helpers.h>
 #include <shared/obi_ctx.h>
 
 static __always_inline void delete_server_trace(pid_connection_info_t *pid_conn,
                                                 trace_key_t *t_key) {
     delete_trace_info_for_connection(&pid_conn->conn, TRACE_TYPE_SERVER);
     int res = bpf_map_delete_elem(&server_traces, t_key);
+    bpf_map_delete_elem(&server_trace_conn, t_key);
     bpf_dbg_printk("Deleting server span for id=%llx, pid=%d, ns=%x",
                    bpf_get_current_pid_tgid(),
                    t_key->p_key.pid,
                    t_key->p_key.ns);
     bpf_dbg_printk("Deleting server span for res=%d", res);
-    obi_ctx__del(bpf_get_current_pid_tgid());
+
+    // Delete traces_ctx_v1 at both eBPF-native key and Agent's per-thread
+    // key to prevent stale entries from polluting subsequent requests.
+    const u64 pid_tgid = bpf_get_current_pid_tgid();
+    obi_ctx__del(pid_tgid);
+
+    const u32 tgid = (u32)(pid_tgid >> 32);
+    const u32 ns_tid = get_task_tid();
+    const u64 agent_key = ((u64)tgid << 32) | (u64)ns_tid;
+    if (agent_key != pid_tgid) {
+        obi_ctx__del(agent_key);
+    }
 }
 
 static __always_inline void delete_client_trace_info(pid_connection_info_t *pid_conn) {
@@ -125,6 +139,16 @@ static __always_inline void server_or_client_trace(
             "Saving thread server span for ns=%x, extra_id=%llx", t_key.p_key.ns, t_key.extra_id);
         bpf_map_update_elem(&server_traces, &t_key, tp_p, BPF_ANY);
         obi_ctx__set(id, &tp_p->tp);
+
+        // For SSL server spans, store the sorted connection so that
+        // find_trace_for_client_request_with_t_key can check incoming_trace_map
+        // for late-arriving traceparent data when creating child spans.
+        if (ssl) {
+            connection_info_t sorted_conn;
+            __builtin_memcpy(&sorted_conn, conn, sizeof(connection_info_t));
+            sort_connection_info(&sorted_conn);
+            bpf_map_update_elem(&server_trace_conn, &t_key, &sorted_conn, BPF_ANY);
+        }
     } else {
         // Setup a pid, so that we can find it in TC.
         // We need the PID id to be able to query ongoing_http and update
@@ -142,6 +166,13 @@ static __always_inline void server_or_client_trace(
             __builtin_memcpy(&tp_p_invalid, tp_p, sizeof(tp_p_invalid));
             tp_p_invalid.valid = 0;
             bpf_map_update_elem(&outgoing_trace_map, &e_key, &tp_p_invalid, BPF_ANY);
+            // NOTE: Do NOT call obi_ctx__set() here for SSL client spans.
+            // The eBPF SSL client span is created DURING curl_easy_perform()
+            // (on TCP connect), but curl_hooks.c reads traces_ctx_v1 BEFORE
+            // that.  Writing the client traceID here would pollute
+            // traces_ctx_v1 with a stale traceID that the next request's
+            // curl hook would read, causing all requests on a keep-alive
+            // connection to share the same traceID.
         } else {
             bpf_map_update_elem(&outgoing_trace_map, &e_key, tp_p, BPF_ANY);
             obi_ctx__set(id, &tp_p->tp);

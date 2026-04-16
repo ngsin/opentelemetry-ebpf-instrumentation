@@ -8,15 +8,21 @@
 #include <common/runtime.h>
 #include <common/trace_helpers.h>
 
+#include <pid/pid_helpers.h>
+
 #include <maps/clone_map.h>
 #include <maps/cp_support_connect_info.h>
 #include <maps/fd_map.h>
 #include <maps/fd_to_connection.h>
+#include <maps/incoming_trace_map.h>
 #include <maps/java_tasks.h>
 #include <maps/nginx_upstream.h>
 #include <maps/nodejs_fd_map.h>
 #include <maps/puma_tasks.h>
+#include <maps/server_trace_conn.h>
 #include <maps/server_traces.h>
+
+#include <shared/obi_ctx.h>
 
 static __always_inline void trace_key_from_pid_tid(trace_key_t *t_key) {
     task_tid(&t_key->p_key);
@@ -106,7 +112,7 @@ static __always_inline tp_info_pid_t *find_parent_process_trace(trace_key_t *t_k
     for (u8 i = 0; i < k_max_depth; ++i) {
         tp_info_pid_t *server_tp = bpf_map_lookup_elem(&server_traces, t_key);
 
-        if (server_tp) {
+        if (server_tp && server_tp->valid) {
             bpf_dbg_printk("Found parent trace for pid=%d, ns=%lx, extra_id=%llx",
                            t_key->p_key.pid,
                            t_key->p_key.ns,
@@ -136,7 +142,7 @@ static __always_inline tp_info_pid_t *find_parent_java_trace(trace_key_t *t_key)
     for (u8 i = 0; i < k_max_depth; ++i) {
         tp_info_pid_t *server_tp = bpf_map_lookup_elem(&server_traces, t_key);
 
-        if (server_tp) {
+        if (server_tp && server_tp->valid) {
             bpf_dbg_printk("Found parent trace for pid=%d, ns=%lx, extra_id=%llx",
                            t_key->p_key.pid,
                            t_key->p_key.ns,
@@ -225,8 +231,89 @@ find_trace_for_client_request_with_t_key(const pid_connection_info_t *p_conn,
             return 0;
         }
 
+        // Early late-binding for SSL server spans:
+        // If the C++ agent wrote the traceparent into incoming_trace_map
+        // AFTER find_trace_for_server_request() ran (i.e. server_tp still
+        // has a random traceID), check incoming_trace_map now and correct
+        // server_tp before the child span inherits the random traceID.
+        //
+        // We use server_trace_conn (keyed by trace_key_t) to find the
+        // sorted server connection, then look up incoming_trace_map.
+        // This avoids the racey traces_ctx_v1[agent_key] approach:
+        // the eBPF uretprobe fires before the Agent's GOT hook, so
+        // traces_ctx_v1 may contain stale data from a previous request.
+        {
+            connection_info_t *srv_conn =
+                bpf_map_lookup_elem(&server_trace_conn, t_key);
+            if (srv_conn) {
+                tp_info_pid_t *late_tp =
+                    bpf_map_lookup_elem(&incoming_trace_map, srv_conn);
+                if (late_tp && valid_trace(late_tp->tp.trace_id) &&
+                    __builtin_memcmp(late_tp->tp.trace_id,
+                                     server_tp->tp.trace_id,
+                                     TRACE_ID_SIZE_BYTES) != 0) {
+                    bpf_dbg_printk(
+                        "Early late-binding: updating server_tp traceID "
+                        "from incoming_trace_map");
+                    __builtin_memcpy(server_tp->tp.trace_id,
+                                     late_tp->tp.trace_id,
+                                     sizeof(server_tp->tp.trace_id));
+                    __builtin_memcpy(server_tp->tp.parent_id,
+                                     late_tp->tp.span_id,
+                                     sizeof(server_tp->tp.parent_id));
+                    // Do NOT delete incoming_trace_map here — finish_http()
+                    // also needs it to correct the server span's traceID
+                    // and send it to the collector.
+                }
+            }
+        }
+
         __builtin_memcpy(tp->trace_id, server_tp->tp.trace_id, sizeof(tp->trace_id));
         __builtin_memcpy(tp->parent_id, server_tp->tp.span_id, sizeof(tp->parent_id));
+
+        // Fallback: if early late-binding above did not fire (e.g. connection
+        // key mismatch between agent and eBPF), check traces_ctx_v1 directly.
+        // The C++ agent writes the correct traceID (parsed from the HTTPS
+        // traceparent header) into traces_ctx_v1 via update_traces_ctx_v1()
+        // during its SSL_read GOT hook — this happens BEFORE the business
+        // code makes outgoing HTTP requests.
+        //
+        // Key priority: try the agent key FIRST.  The agent key
+        // (host_pid << 32 | ns_tid) has the correct traceID from the
+        // parsed traceparent header.  The eBPF native key (pid_tgid)
+        // contains the random traceID from server_or_client_trace() —
+        // which is the same value already in tp->trace_id and server_tp,
+        // so checking it would always find a "match" and never correct.
+        {
+            const u32 tgid = (u32)(pid_tgid >> 32);
+            const u32 ns_tid = get_task_tid();
+            const u64 agent_key = ((u64)tgid << 32) | (u64)ns_tid;
+
+            obi_ctx_info_t *obi_ctx = NULL;
+
+            // In containers (PID namespace), agent_key != pid_tgid.
+            // The agent writes correct traceID under agent_key.
+            if (agent_key != pid_tgid) {
+                obi_ctx = obi_ctx__get(agent_key);
+            }
+
+            // Fallback to eBPF native key (non-containerized processes,
+            // or when finish_http late-binding has already corrected the
+            // eBPF-side entry via obi_ctx__set with pid_tgid key).
+            if (!obi_ctx || !valid_trace(obi_ctx->trace_id)) {
+                obi_ctx = obi_ctx__get(pid_tgid);
+            }
+
+            if (obi_ctx && valid_trace(obi_ctx->trace_id) &&
+                __builtin_memcmp(obi_ctx->trace_id, tp->trace_id,
+                                 TRACE_ID_SIZE_BYTES) != 0) {
+                bpf_dbg_printk("obi_ctx fallback: correcting client span "
+                               "traceID from traces_ctx_v1");
+                __builtin_memcpy(tp->trace_id, obi_ctx->trace_id,
+                                 TRACE_ID_SIZE_BYTES);
+            }
+        }
+
         return 1;
     }
 
@@ -264,6 +351,35 @@ find_parent_trace_for_client_request_with_t_key(const pid_connection_info_t *p_c
         }
 
         *tp = server_tp->tp;
+
+        // obi_ctx fallback: same as find_trace_for_client_request_with_t_key.
+        // tpinjector calls this function via find_parent_trace_for_client_request
+        // and writes the result to outgoing_trace_map.  When
+        // http_get_or_create_trace_info sees the outgoing_trace_map entry,
+        // it uses it directly — bypassing find_trace_for_client_request.
+        // So we must also correct the traceID here.
+        {
+            const u32 tgid = (u32)(pid_tgid >> 32);
+            const u32 ns_tid = get_task_tid();
+            const u64 agent_key = ((u64)tgid << 32) | (u64)ns_tid;
+
+            obi_ctx_info_t *obi_ctx = NULL;
+            if (agent_key != pid_tgid) {
+                obi_ctx = obi_ctx__get(agent_key);
+            }
+            if (!obi_ctx || !valid_trace(obi_ctx->trace_id)) {
+                obi_ctx = obi_ctx__get(pid_tgid);
+            }
+            if (obi_ctx && valid_trace(obi_ctx->trace_id) &&
+                __builtin_memcmp(obi_ctx->trace_id, tp->trace_id,
+                                 TRACE_ID_SIZE_BYTES) != 0) {
+                bpf_dbg_printk("obi_ctx fallback (parent): correcting "
+                               "traceID from traces_ctx_v1");
+                __builtin_memcpy(tp->trace_id, obi_ctx->trace_id,
+                                 TRACE_ID_SIZE_BYTES);
+            }
+        }
+
         return 1;
     }
 

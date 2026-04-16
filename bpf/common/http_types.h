@@ -37,8 +37,9 @@ typedef struct call_protocol_args {
     u8 ssl;
     u8 direction;
     u8 packet_type;
-    unsigned char small_buf[MIN_HTTP2_SIZE];
-    u8 pad[4];
+    unsigned char small_buf[FULL_BUF_SIZE];
+    u8 accumulated; // 1 = data came from SSL_read accumulation, use small_buf instead of u_buf
+    u8 pad[3];
     int bytes_len;
     u16 orig_dport;
     u16 _pad2;
