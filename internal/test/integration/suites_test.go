@@ -260,6 +260,28 @@ func TestSuite_Java_Host_Network(t *testing.T) {
 	require.NoError(t, compose.Close())
 }
 
+func TestSuite_Cpp(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-cpp.yml", path.Join(pathOutput, "test-suite-cpp.log"))
+	require.NoError(t, err)
+
+	require.NoError(t, compose.Up())
+	t.Run("C++ client RED metrics", testREDMetricsCppHTTPClient)
+	t.Run("C++ server RED metrics", testREDMetricsCppHTTPServer)
+	t.Run("C++ HTTPS client RED metrics", testREDMetricsCppHTTPSClient)
+	t.Run("C++ HTTPS server RED metrics", testREDMetricsCppHTTPSServer)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_CppRedis(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-cpp-redis.yml", path.Join(pathOutput, "test-suite-cpp-redis.log"))
+	require.NoError(t, err)
+
+	require.NoError(t, compose.Up())
+	t.Run("C++ HTTP + Redis trace correlation", testCppRedisTraceCorrelation)
+	t.Run("C++ HTTPS + Redis trace correlation", testCppRedisTraceCorrelationTLS)
+	require.NoError(t, compose.Close())
+}
+
 func TestSuite_Rust(t *testing.T) {
 	compose, err := docker.ComposeSuite("docker-compose-rust.yml", path.Join(pathOutput, "test-suite-rust.log"))
 	require.NoError(t, err)

@@ -1,0 +1,25 @@
+routes:
+  patterns:
+    - /redis-ping
+    - /mysql-ping
+    - /pg-ping
+    - /all
+    - /greeting
+  unmatched: path
+cpp:
+  enabled: true
+  debug: true
+ebpf:
+  context_propagation: headers
+  track_request_headers: true
+  disable_black_box_cp: true
+  bpf_debug: true
+  protocol_debug_print: true
+otel_metrics_export:
+  endpoint: http://otelcol:4318
+otel_traces_export:
+  endpoint: http://otelcol:4318
+attributes:
+  select:
+    "*":
+      include: ["*"]

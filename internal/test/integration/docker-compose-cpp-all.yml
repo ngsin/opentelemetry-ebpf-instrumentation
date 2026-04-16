@@ -1,0 +1,235 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Comprehensive C++ integration test: Redis + MySQL + PostgreSQL
+# Tests OBI's eBPF protocol detection for HTTP, Redis RESP, MySQL, and PostgreSQL
+# on both HTTP (plain) and HTTPS (SSL/TLS) C++ servers.
+
+version: "3.8"
+
+services:
+  # --- Database backends ---
+
+  redis:
+    build:
+      context: components/redis/
+      dockerfile: Dockerfile
+    image: redis
+
+  mysql:
+    build:
+      context: components/mysqldb/
+      dockerfile: Dockerfile
+    image: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "p_ssW0rd"
+      MYSQL_DATABASE: "sakila"
+    ports:
+      - "3306:3306"
+
+  postgres:
+    build:
+      context: components/postgresql/
+      dockerfile: Dockerfile
+    image: postgres
+    environment:
+      POSTGRES_PASSWORD: "postgres"
+    ports:
+      - "5432:5432"
+
+  # --- C++ HTTP/HTTPS servers ---
+
+  # cpphttpsvc: HTTP server on port 8080
+  # Endpoints: /greeting, /redis-ping, /mysql-ping, /pg-ping, /all, /health
+  cpphttpsvc:
+    build:
+      context: components/cpphttpsvc
+      dockerfile: Dockerfile
+    image: hatest-cpphttpsvc
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_HOST: redis
+      MYSQL_HOST: mysql
+      PG_HOST: postgres
+    depends_on:
+      redis:
+        condition: service_started
+      mysql:
+        condition: service_started
+      postgres:
+        condition: service_started
+
+  # cpphttpssvc: HTTPS server on port 8443 (same binary, TLS mode)
+  cpphttpssvc:
+    build:
+      context: components/cpphttpsvc
+      dockerfile: Dockerfile
+    image: hatest-cpphttpsvc
+    ports:
+      - "8443:8443"
+    entrypoint: ["/app/cpphttpssvc"]
+    command: ["8443", "--tls", "/app/certs/cert.pem", "/app/certs/key.pem"]
+    environment:
+      REDIS_HOST: redis
+      MYSQL_HOST: mysql
+      PG_HOST: postgres
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:ro
+    depends_on:
+      redis:
+        condition: service_started
+      mysql:
+        condition: service_started
+      postgres:
+        condition: service_started
+
+  # --- Auto-request curl clients (round-robin across all endpoints) ---
+
+  # cppsvc: HTTP curl client, cycles through all endpoints
+  cppsvc:
+    build:
+      context: components/cppsvc
+      dockerfile: Dockerfile
+    image: hatest-cppsvc
+    command:
+      - "http://cpphttpsvc:8080/redis-ping"
+      - "http://cpphttpsvc:8080/mysql-ping"
+      - "http://cpphttpsvc:8080/pg-ping"
+      - "http://cpphttpsvc:8080/all"
+      - "2"
+      - "200"
+    depends_on:
+      cpphttpsvc:
+        condition: service_started
+
+  # cppsvctls: HTTPS curl client, cycles through all endpoints over TLS
+  cppsvctls:
+    build:
+      context: components/cppsvc
+      dockerfile: Dockerfile
+    image: hatest-cppsvc
+    entrypoint: ["/app/cppsvctls"]
+    command:
+      - "https://cpphttpssvc:8443/redis-ping"
+      - "https://cpphttpssvc:8443/mysql-ping"
+      - "https://cpphttpssvc:8443/pg-ping"
+      - "https://cpphttpssvc:8443/all"
+      - "2"
+      - "200"
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:ro
+    depends_on:
+      cpphttpssvc:
+        condition: service_started
+
+  # --- OBI (eBPF instrumentation) ---
+
+  obi:
+    build:
+      context: ../../..
+      dockerfile: ./internal/test/integration/components/obi/Dockerfile
+    command:
+      - --config=/configs/obi-config-cpp-all.yml
+    volumes:
+      - ./configs/:/configs
+      - ./system/sys/kernel/security:/sys/kernel/security
+      - /sys/fs/cgroup/unified:/sys/fs/cgroup/unified
+      - ../../../testoutput:/coverage
+      - ../../../testoutput/run-cpp-all:/var/run/obi
+      - /sys/fs/bpf:/sys/fs/bpf
+    image: hatest-cppallobi
+    privileged: true
+    pid: "host"
+    environment:
+      GOCOVERDIR: "/coverage"
+      OTEL_EBPF_TRACE_PRINTER: "text"
+      OTEL_EBPF_EXECUTABLE_PATH: "(cppsvc|cppsvctls|cpphttpsvc|cpphttpssvc)"
+      OTEL_EBPF_SERVICE_NAMESPACE: "integration-test"
+      OTEL_EBPF_METRICS_INTERVAL: "10ms"
+      OTEL_EBPF_OTLP_TRACES_BATCH_TIMEOUT: "1ms"
+      OTEL_EBPF_BPF_BATCH_TIMEOUT: "10ms"
+      OTEL_EBPF_LOG_LEVEL: "DEBUG"
+      OTEL_EBPF_BPF_DEBUG: "TRUE"
+      OTEL_EBPF_HOSTNAME: "beyla"
+      OTEL_EBPF_CPP_ENABLED: "true"
+      OTEL_EBPF_CPP_DEBUG: "true"
+      OTEL_EBPF_DISCOVERY_POLL_INTERVAL: 500ms
+      OTEL_EBPF_PROCESSES_INTERVAL: "100ms"
+      OTEL_EBPF_INTERNAL_METRICS_PROMETHEUS_PORT: 8999
+      OTEL_EBPF_BPF_HTTP_REQUEST_TIMEOUT: "5s"
+      # SQL protocol detection settings
+      # NOTE: BUFFER_SIZE_MYSQL/POSTGRES removed — non-zero values disable BPF
+      # dead-code elimination of large-buffer handlers, causing verifier failure
+      # on kernel 5.15 ("obi_protocol_tcp: bad address"). Protocol detection
+      # (is_mysql/is_postgres) still works with buffer_size=0 (default).
+      OTEL_EBPF_TRACES_INSTRUMENTATIONS: "http,sql,redis"
+      OTEL_EBPF_METRICS_INSTRUMENTATIONS: "http,sql,redis"
+      OTEL_EBPF_METRICS_FEATURES: "application"
+    depends_on:
+      cppsvc:
+        condition: service_started
+      cpphttpsvc:
+        condition: service_started
+      cppsvctls:
+        condition: service_started
+      cpphttpssvc:
+        condition: service_started
+
+  # --- Observability backends ---
+
+  # OpenTelemetry Collector for Metrics and Traces fanout
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.147.0@sha256:e7c92c715f28ff142f3bcaccd4fc5603cf4c71276ef09954a38eb4038500a5a5
+    container_name: otel-col
+    deploy:
+      resources:
+        limits:
+          memory: 125M
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-config/otelcol-config.yml"]
+    volumes:
+      - ./configs/:/etc/otelcol-config
+    ports:
+      - "4317" # OTLP over gRPC receiver
+      - "4318" # OTLP over HTTP receiver
+      - "9464" # Prometheus exporter
+      - "8888" # metrics endpoint
+    depends_on:
+      prometheus:
+        condition: service_started
+      jaeger:
+        condition: service_started
+
+  # Prometheus
+  prometheus:
+    image: quay.io/prometheus/prometheus:v3.10.0@sha256:7571a304e67fbd794be02422b13627dc7de822152f74e99e2bef95d29eceecde
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus-config.yml
+      - --web.enable-lifecycle
+      - --web.route-prefix=/
+    volumes:
+      - ./configs/:/etc/prometheus
+    ports:
+      - "9090:9090"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60@sha256:4fd2d70fa347d6a47e79fcb06b1c177e6079f92cba88b083153d56263082135e
+    ports:
+      - "16686:16686" # Query frontend
+      - "4317" # OTEL GRPC traces collector
+      - "4318" # OTEL HTTP traces collector
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - LOG_LEVEL=debug
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.200.0.0/16
