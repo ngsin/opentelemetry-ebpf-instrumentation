@@ -1,9 +1,11 @@
 ARG TAG=0.2.10@sha256:b00857fa2cf0c69a7b4c07a079e84ba8b130d26efe8365cc88eb32ec62ea63f7
 
 # Build the C++ OBI agent (shared library injected via ptrace into target processes)
-FROM alpine:3.19 AS cppagent-builder
+FROM ubuntu:noble AS cppagent-builder
 
-RUN apk add --no-cache gcc musl-dev make linux-headers file binutils
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libc6-dev make linux-libc-dev file binutils \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY pkg/internal/cpp/agent/ .
