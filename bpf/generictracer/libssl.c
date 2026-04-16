@@ -251,9 +251,30 @@ int BPF_UPROBE(obi_uprobe_ssl_shutdown, void *s) {
 
     ssl_pid_connection_info_t *s_conn = bpf_map_lookup_elem(&ssl_to_conn, &s);
     if (s_conn) {
-        finish_possible_delayed_tls_http_request(&s_conn->p_conn, s);
+        // First, finish any delayed but unsubmitted HTTP request.
+        // For SSL connections, the kernel-level tcp_sendmsg handler
+        // skips SSL traffic (active_send_args is never populated),
+        // so finish_possible_delayed_http_request never fires through
+        // the normal kernel path.  SSL_shutdown is often the last
+        // chance to submit the span before the connection is torn down.
+        http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &s_conn->p_conn);
+        if (info && !info->submitted) {
+            if (http_info_complete(info)) {
+                finish_http(ctx, info, &s_conn->p_conn);
+            } else {
+                // The request never got a response — force-finish it
+                // so it doesn't leak in the map.
+                force_finish_http(ctx, info, &s_conn->p_conn);
+            }
+        }
+        // Clean up already-submitted entries (trace cleanup).
+        finish_possible_delayed_tls_http_request(ctx, &s_conn->p_conn, s);
         bpf_map_delete_elem(&active_ssl_connections, &s_conn->p_conn);
     }
+
+    // Clean up the SSL read accumulation entry.
+    const u64 ssl_ptr = (u64)s;
+    bpf_map_delete_elem(&ssl_read_accum, &ssl_ptr);
 
     bpf_map_delete_elem(&ssl_to_conn, &s);
     bpf_map_delete_elem(&ssl_to_pid_tid, &s);

@@ -14,6 +14,7 @@
 #include <generictracer/protocol_http.h>
 
 #include <generictracer/maps/pid_tid_to_conn.h>
+#include <generictracer/maps/ssl_read_accum.h>
 #include <generictracer/maps/ssl_to_pid_tid.h>
 
 #include <maps/ssl_to_conn.h>
@@ -135,6 +136,144 @@ handle_ssl_buf(void *ctx, u64 id, ssl_args_t *args, int bytes_len, u8 direction)
             bpf_dbg_printk("SSL conn");
             dbg_print_http_connection_info(&conn->p_conn.conn);
 
+            // SSL_read buffer aggregation for byte-at-a-time readers (e.g. cpp-httplib).
+            // When SSL_read returns fewer than MIN_HTTP_SIZE bytes we cannot detect the
+            // HTTP protocol.  Accumulate small reads into a per-SSL BPF map until we
+            // have enough data for protocol detection, then dispatch the aggregated
+            // buffer directly (bypassing handle_buf_with_connection's bpf_probe_read
+            // which would over-read a tiny user-space buffer).
+            if (direction == TCP_RECV && bytes_len > 0 && bytes_len < MIN_HTTP_SIZE) {
+                ssl_read_accum_t *accum = bpf_map_lookup_elem(&ssl_read_accum, &ssl_ptr);
+                if (!accum) {
+                    ssl_read_accum_t new_accum = {};
+                    bpf_map_update_elem(&ssl_read_accum, &ssl_ptr, &new_accum, BPF_NOEXIST);
+                    accum = bpf_map_lookup_elem(&ssl_read_accum, &ssl_ptr);
+                    if (!accum) {
+                        // Map full — fall through to normal path as best-effort
+                        goto normal_ssl_path;
+                    }
+                }
+
+                u16 pos = accum->pos;
+                // Bounds check for verifier: pos must be within buffer.
+                // pos == FULL_BUF_SIZE is also used as a sentinel after a
+                // successful accumulation dispatch — it tells us "this
+                // connection already dispatched an accumulated request, don't
+                // re-accumulate until the response clears the entry".
+                if (pos >= FULL_BUF_SIZE) {
+                    // Already dispatched or buffer full — pass through to
+                    // normal path.  Do NOT delete the entry; it serves as a
+                    // sentinel so subsequent small reads on the same SSL
+                    // connection are routed to handle_buf_with_connection
+                    // (which will hit still_reading / still_responding in the
+                    // HTTP handler) instead of being re-accumulated into a
+                    // garbage second request.
+                    goto normal_ssl_path;
+                }
+
+                // Copy exactly 1 byte from user-space into the accumulation buffer.
+                // This is the fast path for byte-at-a-time readers (e.g. cpp-httplib).
+                // bytes_len is guaranteed to be [1, MIN_HTTP_SIZE) by the enclosing
+                // `if`, and typically equals 1.  We only accumulate the first byte of
+                // each SSL_read to avoid verifier complexity; multi-byte small reads
+                // (2-11 bytes) are rare and will simply accumulate more slowly.
+                bpf_probe_read(&accum->buf[pos], 1, (void *)args->buf);
+                pos++;
+                accum->pos = pos;
+
+                if (pos < MIN_HTTP_SIZE) {
+                    // Not enough data yet — we need at least MIN_HTTP_SIZE
+                    // (12) bytes for HTTP protocol detection (e.g. "GET / HTTP/").
+                    // We dispatch early rather than waiting for FULL_BUF_SIZE
+                    // because cpp-httplib reads the request line byte-at-a-time
+                    // then switches to larger reads for headers.  If we waited
+                    // for 256 bytes, the large header read would arrive first,
+                    // clear the accumulation, and pass header data (without the
+                    // "GET" prefix) to protocol detection — which would fail.
+                    // After dispatching, subsequent reads (both small and large)
+                    // go through normal_ssl_path → handle_buf_with_connection →
+                    // still_reading, which captures the rest of the request.
+                    return;
+                }
+
+                // We have enough data for HTTP protocol detection.
+                // Subsequent 1-byte SSL_reads will hit the sentinel
+                // (pos >= FULL_BUF_SIZE) and route through normal_ssl_path
+                // → handle_buf_with_connection → still_reading, which
+                // appends each byte to info->buf, capturing the full URL
+                // and headers (including traceparent).
+                bpf_dbg_printk("SSL accum dispatch: pos=%d", pos);
+
+                call_protocol_args_t *pargs = make_protocol_args(
+                    &conn->p_conn, (void *)args->buf, bytes_len, WITH_SSL, direction, conn->orig_dport);
+                if (!pargs) {
+                    bpf_map_delete_elem(&ssl_read_accum, &ssl_ptr);
+                    return;
+                }
+                __builtin_memcpy(&pargs->pid_conn, &conn->p_conn, sizeof(pid_connection_info_t));
+                // Clamp pos for verifier
+                if (pos > FULL_BUF_SIZE) {
+                    pos = FULL_BUF_SIZE;
+                }
+                bpf_probe_read_kernel(pargs->small_buf, FULL_BUF_SIZE, accum->buf);
+                pargs->accumulated = 1;
+                pargs->bytes_len = (int)pos;
+
+                // Mark the accumulation entry as "dispatched" so subsequent
+                // small reads on this SSL connection pass through to
+                // normal_ssl_path (the sentinel check at the top will match).
+                // The entry is cleared when:
+                //  (a) a normal-size read arrives (the cleanup below), or
+                //  (b) an SSL_write (response) triggers the TCP_SEND path.
+                accum->pos = FULL_BUF_SIZE;
+                bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+                // tail call doesn't return; if it fails, fall through
+                return;
+            }
+
+            // Normal-size read or SSL_write: manage the accumulation entry.
+            {
+                ssl_read_accum_t *accum = bpf_map_lookup_elem(&ssl_read_accum, &ssl_ptr);
+                if (accum) {
+                    if (direction == TCP_SEND) {
+                        // SSL_write (response): always delete the accumulation
+                        // entry — both stale partial data and the sentinel.
+                        // After the response, the next request must start a
+                        // fresh accumulation cycle so its "GET / HTTP/1.1"
+                        // prefix is captured for protocol detection.
+                        // Without this, the sentinel routes the next request's
+                        // byte-at-a-time SSL_reads through normal_ssl_path
+                        // where they hit still_responding and keep refreshing
+                        // end_monotime_ns — preventing the Go-level timeout
+                        // from ever emitting the delayed server span.
+                        bpf_map_delete_elem(&ssl_read_accum, &ssl_ptr);
+                    } else if (accum->pos < FULL_BUF_SIZE) {
+                        // TCP_RECV with large read: clear stale partial data
+                        // that was never dispatched.
+                        bpf_map_delete_elem(&ssl_read_accum, &ssl_ptr);
+                    }
+                    // TCP_RECV with sentinel (pos == FULL_BUF_SIZE): keep it
+                    // so the current request's subsequent small reads route
+                    // through normal_ssl_path → still_reading.
+                }
+            }
+
+normal_ssl_path:
+            // For SSL_write (response direction TCP_SEND), finish any
+            // previous delayed HTTP request before processing the response.
+            // This is critical for byte-at-a-time SSL_read connections
+            // (e.g. cpp-httplib) where the kernel-level tcp_sendmsg skips
+            // SSL connections (active_send_args is never populated), so
+            // finish_possible_delayed_http_request is never called through
+            // the normal kernel path.  Without this, the delayed request
+            // stays in ongoing_http forever, and get_or_set_http_info
+            // never runs because is_http fails on 1-byte buffers.
+            if (direction == TCP_SEND) {
+                http_info_t *prev = bpf_map_lookup_elem(&ongoing_http, &conn->p_conn);
+                if (prev && prev->delayed && !prev->submitted) {
+                    finish_http(ctx, prev, &conn->p_conn);
+                }
+            }
             // We should attempt to clean up the server trace immediately. The cleanup information
             // is keyed of the *ssl, so when it's delayed we might have different *ssl on the same
             // connection.

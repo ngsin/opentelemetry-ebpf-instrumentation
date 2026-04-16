@@ -1232,6 +1232,21 @@ int obi_handle_buf_with_args(void *ctx) {
                                        k_large_buf_action_append);
 
                 if (reading) {
+                    // Append incoming byte(s) to info->buf so the full URL is
+                    // captured.  This is critical for byte-at-a-time SSL_read
+                    // (e.g. cpp-httplib): the initial accumulation dispatch
+                    // only fills the first MIN_HTTP_SIZE bytes of info->buf;
+                    // subsequent reads land here (is_http fails on the 1-byte
+                    // user buffer) and must continue building the URL.
+                    //
+                    // Stop appending once buf is full.  The bitmask
+                    // (& (FULL_BUF_SIZE-1)) wraps around at 256, which would
+                    // overwrite the request line at buf[0] — corrupting
+                    // http.request.method in the exported span.
+                    if (info->len < FULL_BUF_SIZE && args->bytes_len > 0) {
+                        u32 buf_off = info->len & (FULL_BUF_SIZE - 1);
+                        bpf_probe_read(&info->buf[buf_off], 1, (void *)args->u_buf);
+                    }
                     info->len += args->bytes_len;
                 } else if (responding) {
                     info->end_monotime_ns = bpf_ktime_get_ns();
