@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
+	cppagent "go.opentelemetry.io/obi/pkg/internal/cpp"
 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
 	"go.opentelemetry.io/obi/pkg/internal/transform/route/harvest"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -45,6 +46,7 @@ type traceAttacher struct {
 	existingTracers     map[uint64]*ebpf.ProcessTracer
 	nodeInjector        *nodejs.NodeInjector
 	javaInjector        *javaagent.JavaInjector
+	cppInjector         *cppagent.CppInjector
 	reusableTracer      *ebpf.ProcessTracer
 	reusableGoTracer    *ebpf.ProcessTracer
 	commonTracersLoaded bool
@@ -89,6 +91,27 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 	} else {
 		ta.javaInjector = javaInjector
 	}
+	cppInjector, err := cppagent.NewCppInjector(ta.Cfg)
+	if err != nil {
+		ta.log.Warn("unable to create C++ injector, C++ instrumentation will not work", "error", err)
+	} else if cppInjector != nil {
+		ta.cppInjector = cppInjector
+		// Wire the C++ agent's span output channel. Currently we drain and
+		// discard all spans because kprobe/uprobe produces strictly more
+		// complete spans (with server.port, client.address, body_size, etc.)
+		// and Redis sub-spans.  The C++ agent is kept only for HTTPS
+		// traceparent header injection (see curl_hooks.c).
+		if ta.SpanSignalsShortcut != nil {
+			cppSpanCh := make(chan []request.Span, 100)
+			ta.cppInjector.SpanOutput = cppSpanCh
+			go func() {
+				for range cppSpanCh {
+					// Discard C++ agent spans — kprobe/uprobe produces
+					// complete spans for the same HTTP requests.
+				}
+			}()
+		}
+	}
 	ta.processInstances = maps.MultiCounter[uint64]{}
 	ta.EbpfEventContext.CommonPIDsFilter = ebpfcommon.NewPIDsFilter(&ta.Cfg.Discovery, slog.With("component", "ebpfCommon.CommonPIDsFilter"), ta.Metrics)
 	ta.routeHarvester = harvest.NewRouteHarvester(&ta.Cfg.Discovery.RouteHarvestConfig, ta.Cfg.Discovery.DisabledRouteHarvesters, ta.Cfg.Discovery.RouteHarvesterTimeout)
@@ -114,6 +137,11 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 							ta.log.Warn("unable to attach java agent to process, Java TLS telemetry will not work", "pid", instr.Obj.FileInfo.Pid, "error", err)
 						}
 					}
+					if ta.cppInjector != nil {
+						if err := ta.cppInjector.NewExecutable(&instr.Obj); err != nil {
+							ta.log.Warn("unable to attach C++ agent to process", "pid", instr.Obj.FileInfo.Pid, "error", err)
+						}
+					}
 
 					ta.processInstances.Inc(instr.Obj.FileInfo.Ino)
 					if ok := ta.getTracer(&instr.Obj); ok {
@@ -125,6 +153,9 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 					}
 				case EventDeleted:
 					ta.notifyProcessDeletion(&instr.Obj)
+					if ta.cppInjector != nil {
+						ta.cppInjector.ProcessDeleted(&instr.Obj)
+					}
 				}
 			}
 		})
@@ -170,6 +201,10 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 	// builds a tracer for that executable
 	var programs []ebpf.Tracer
 	tracerType := ebpf.Generic
+	// Track whether we load common tracers (tpinjector, etc.) in this attempt.
+	// If the tracer fails to fully initialize later, we must reset the flag so
+	// the next process discovery attempt will load them again.
+	commonTracersLoadedBefore := ta.commonTracersLoaded
 	switch ie.Type {
 	case svc.InstrumentableGolang:
 		// gets all the possible supported tracers for a go program, and filters out
@@ -210,6 +245,11 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 		return false
 	}
 
+	// Track whether we included common tracers (tpinjector, etc.) in this attempt.
+	// If the tracer fails to fully initialize, we must reset the flag so that
+	// the next process discovery attempt will load them again.
+	includedCommonTracers := !commonTracersLoadedBefore && ta.commonTracersLoaded
+
 	ie.FileInfo.Service.SDKLanguage = ie.Type
 	// Must be called after we've set the SDKLanguage
 	ta.harvestRoutes(ie, false)
@@ -218,6 +258,9 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 	// to allow loading it from different container/pods in containerized environments
 	exe, ok := ta.loadExecutable(ie)
 	if !ok {
+		if includedCommonTracers {
+			ta.commonTracersLoaded = false
+		}
 		ta.Metrics.InstrumentationError(ie.FileInfo.ExecutableName(), imetrics.InstrumentationErrorInspectionFailed)
 		return false
 	}
@@ -225,7 +268,11 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 	tracer := ebpf.NewProcessTracer(tracerType, programs, ta.Cfg, ta.Metrics)
 
 	if err := tracer.Init(ta.EbpfEventContext); err != nil {
-		ta.log.Error("couldn't trace process. Stopping process tracer", "error", err)
+		ta.log.Error("couldn't trace process. Stopping process tracer",
+			"pid", ie.FileInfo.Pid, "cmd", ie.FileInfo.CmdExePath, "error", err)
+		if includedCommonTracers {
+			ta.commonTracersLoaded = false
+		}
 		ta.Metrics.InstrumentationError(ie.FileInfo.ExecutableName(), imetrics.InstrumentationErrorInspectionFailed)
 		return false
 	}
@@ -233,6 +280,11 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 	ie.Tracer = tracer
 
 	if err := tracer.NewExecutable(exe, ie); err != nil {
+		ta.log.Error("failed to attach to executable",
+			"pid", ie.FileInfo.Pid, "cmd", ie.FileInfo.CmdExePath, "error", err)
+		if includedCommonTracers {
+			ta.commonTracersLoaded = false
+		}
 		ta.Metrics.InstrumentationError(ie.FileInfo.ExecutableName(), imetrics.InstrumentationErrorAttachingUprobe)
 		return false
 	}
