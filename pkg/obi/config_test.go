@@ -311,6 +311,10 @@ discovery:
 			Enabled: true,
 			Timeout: 10 * time.Second,
 		},
+		CPP: CPPConfig{
+			Enabled: false,
+			Timeout: 15 * time.Second,
+		},
 	}, cfg)
 }
 
@@ -811,4 +815,39 @@ func TestNormalizeConfig_Network(t *testing.T) {
 	obi.normalize()
 	assert.Equal(t, export.FeatureApplicationRED|export.FeatureNetwork,
 		obi.Metrics.Features)
+}
+
+func TestConfig_CPPFromEnv(t *testing.T) {
+	t.Setenv("OTEL_EBPF_CPP_ENABLED", "true")
+	t.Setenv("OTEL_EBPF_CPP_DEBUG", "true")
+	t.Setenv("OTEL_EBPF_CPP_INJECT_TIMEOUT", "20s")
+	cfg, err := LoadConfig(bytes.NewReader(nil))
+	require.NoError(t, err)
+	assert.True(t, cfg.CPP.Enabled)
+	assert.True(t, cfg.CPP.Debug)
+	assert.Equal(t, 20*time.Second, cfg.CPP.Timeout)
+}
+
+func TestConfig_CPPFromYAML(t *testing.T) {
+	userConfig := bytes.NewBufferString(`
+cpp:
+  enabled: true
+  debug: false
+  inject_timeout: 30s
+otel_metrics_export:
+  endpoint: http://localhost:4318
+`)
+	cfg, err := LoadConfig(userConfig)
+	require.NoError(t, err)
+	assert.True(t, cfg.CPP.Enabled)
+	assert.False(t, cfg.CPP.Debug)
+	assert.Equal(t, 30*time.Second, cfg.CPP.Timeout)
+}
+
+func TestConfig_CPPDefaults(t *testing.T) {
+	cfg, err := LoadConfig(bytes.NewReader(nil))
+	require.NoError(t, err)
+	assert.False(t, cfg.CPP.Enabled)
+	assert.False(t, cfg.CPP.Debug)
+	assert.Equal(t, 15*time.Second, cfg.CPP.Timeout)
 }

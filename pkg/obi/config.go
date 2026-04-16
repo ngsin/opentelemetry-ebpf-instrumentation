@@ -290,6 +290,10 @@ var DefaultConfig = Config{
 		Enabled: true,
 		Timeout: 10 * time.Second,
 	},
+	CPP: CPPConfig{
+		Enabled: false,
+		Timeout: 15 * time.Second,
+	},
 }
 
 type Config struct {
@@ -376,6 +380,7 @@ type Config struct {
 
 	NodeJS NodeJSConfig `yaml:"nodejs"`
 	Java   JavaConfig   `yaml:"javaagent"`
+	CPP    CPPConfig    `yaml:"cpp"`
 }
 
 func (c *Config) Unmarshal(component *confmap.Conf) error {
@@ -562,6 +567,12 @@ type JavaConfig struct {
 	Debug                bool          `yaml:"debug" env:"OTEL_EBPF_JAVAAGENT_DEBUG"`
 	DebugInstrumentation bool          `yaml:"debug_instrumentation" env:"OTEL_EBPF_JAVAAGENT_DEBUG_INSTRUMENTATION"`
 	Timeout              time.Duration `yaml:"attach_timeout" env:"OTEL_EBPF_JAVAAGENT_ATTACH_TIMEOUT" validate:"gte=0"`
+}
+
+type CPPConfig struct {
+	Enabled bool          `yaml:"enabled" env:"OTEL_EBPF_CPP_ENABLED"`
+	Debug   bool          `yaml:"debug" env:"OTEL_EBPF_CPP_DEBUG"`
+	Timeout time.Duration `yaml:"inject_timeout" env:"OTEL_EBPF_CPP_INJECT_TIMEOUT" validate:"gte=0"`
 }
 
 type ConfigError string
