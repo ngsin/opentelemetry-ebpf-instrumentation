@@ -150,7 +150,7 @@ func TestWriteConfigFile_HttpServer(t *testing.T) {
 
 	content := string(data)
 	assert.Contains(t, content, "socket_path=/tmp/.obi-99.sock")
-	assert.Contains(t, content, "flags=0") // HTTP server hooks intentionally not set
+	assert.Contains(t, content, "flags=16") // OBI_CFG_HTTP_SERVER_TLS_HOOK=16 for HTTPS traceparent parsing
 	assert.Contains(t, content, "host_pid=2000")
 }
 
@@ -180,7 +180,7 @@ func TestWriteConfigFile_AllFlags(t *testing.T) {
 
 	content := string(data)
 	assert.Contains(t, content, "socket_path=/tmp/.obi-77.sock")
-	assert.Contains(t, content, "flags=7") // 1(debug) + 2(curl) + 4(grpc) = 7; HTTP server hooks not set
+	assert.Contains(t, content, "flags=23") // 1(debug) + 2(curl) + 4(grpc) + 16(tls_server) = 23
 	assert.Contains(t, content, "bpf_map_path=/sys/fs/bpf/otel/traces_ctx_v1")
 	assert.Contains(t, content, "host_pid=3000")
 }

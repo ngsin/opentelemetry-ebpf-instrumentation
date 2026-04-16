@@ -82,7 +82,7 @@ func TestFindLibcBaseFromMaps_MuslLibc(t *testing.T) {
 
 	base, _, err := findLibcBaseFromMaps(1, maps)
 	require.NoError(t, err)
-	assert.Equal(t, uintptr(0x7f0001000000), base)
+	assert.Equal(t, uintptr(0x7f0000000000), base) // ld-musl-* matches first and IS musl's libc
 }
 
 func TestResolveDynSymOffset_RealLibc(t *testing.T) {

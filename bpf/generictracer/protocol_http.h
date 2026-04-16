@@ -337,6 +337,10 @@ static __always_inline void finish_http(http_info_t *info, pid_connection_info_t
                 }
             }
 
+            // Save fields before submit — ringbuf ref is invalid after submit
+            const u8 trace_ssl = trace->ssl;
+            const u8 trace_type = trace->type;
+
             bpf_ringbuf_submit(trace, get_flags());
 
             // Clean up traces_ctx_v1 after sending the span.  The late-binding
@@ -345,7 +349,7 @@ static __always_inline void finish_http(http_info_t *info, pid_connection_info_t
             // Now that the span is sent, delete both the eBPF-native key and
             // the Agent's per-thread key to prevent stale traceIDs from
             // leaking into subsequent requests on the same thread.
-            if (trace->ssl && trace->type == EVENT_HTTP_REQUEST) {
+            if (trace_ssl && trace_type == EVENT_HTTP_REQUEST) {
                 const u64 pid_tgid_key = bpf_get_current_pid_tgid();
                 obi_ctx__del(pid_tgid_key);
 
