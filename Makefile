@@ -23,7 +23,7 @@ IMG_ORG ?=
 IMG_NAME ?= ebpf-instrument
 
 # Container image creation creation
-VERSION ?= dev
+VERSION ?= $(shell date +%Y%m%d)-$(shell git rev-parse --short HEAD)
 IMG ?= $(IMG_REGISTRY)/$(IMG_ORG)/$(IMG_NAME):$(VERSION)
 
 # The generator is a container image that provides a reproducible environment for
