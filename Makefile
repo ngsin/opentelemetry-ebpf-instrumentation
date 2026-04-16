@@ -383,6 +383,31 @@ java-clean:
 .PHONY: java-verify
 java-verify: java-spotless-check java-test java-build
 
+# C++ Agent targets
+CPP_AGENT_DIR := pkg/internal/cpp/agent
+CPP_AGENT_EMBED_DIR := $(CPP_AGENT_DIR)/embedded
+
+.PHONY: cpp-agent-build
+cpp-agent-build:
+	@echo "### Building C++ agent"
+	cd $(CPP_AGENT_DIR) && make all
+
+.PHONY: cpp-agent-docker-build
+cpp-agent-docker-build:
+	@echo "### Building C++ agent with Docker"
+	mkdir -p $(CPP_AGENT_EMBED_DIR)
+	$(OCI_BIN) build --output type=local,dest=$(CPP_AGENT_EMBED_DIR) -f $(CPP_AGENT_DIR)/Dockerfile $(CPP_AGENT_DIR)
+
+.PHONY: cpp-agent-test
+cpp-agent-test:
+	@echo "### Testing C++ agent"
+	cd $(CPP_AGENT_DIR) && make test
+
+.PHONY: cpp-agent-clean
+cpp-agent-clean:
+	@echo "### Cleaning C++ agent build artifacts"
+	cd $(CPP_AGENT_DIR) && make clean
+
 # image-build is only used for local development. GH actions that build and publish the image don't make use of it
 .PHONY: image-build
 image-build:
