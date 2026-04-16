@@ -310,7 +310,7 @@ static __always_inline void handle_unknown_tcp_connection(pid_connection_info_t 
                 obi_ctx__set(lb_id, &existing->tp);
             }
 
-            tcp_req_t *trace = empty_tcp_req();
+            tcp_req_t *trace = bpf_ringbuf_reserve(&events, sizeof(tcp_req_t), 0);
             if (trace) {
                 bpf_dbg_printk("Sending TCP trace: existing=%lx, resp_length=%d",
                                existing,

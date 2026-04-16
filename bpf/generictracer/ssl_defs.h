@@ -271,7 +271,7 @@ normal_ssl_path:
             if (direction == TCP_SEND) {
                 http_info_t *prev = bpf_map_lookup_elem(&ongoing_http, &conn->p_conn);
                 if (prev && prev->delayed && !prev->submitted) {
-                    finish_http(ctx, prev, &conn->p_conn);
+                    finish_http(prev, &conn->p_conn);
                 }
             }
             // We should attempt to clean up the server trace immediately. The cleanup information

@@ -337,7 +337,7 @@ static __always_inline void finish_http(http_info_t *info, pid_connection_info_t
                 }
             }
 
-            SEND_EVENT(ctx, trace);
+            bpf_ringbuf_submit(trace, get_flags());
 
             // Clean up traces_ctx_v1 after sending the span.  The late-binding
             // block above wrote obi_ctx__set() so that the C++ agent curl hook
@@ -634,8 +634,7 @@ static __always_inline int __obi_continue2_protocol_http(struct pt_regs *ctx,
         // large buffer path (which would over-read from the 1-byte u_buf).
         __builtin_memcpy(info->buf, args->small_buf, FULL_BUF_SIZE);
     } else {
-        http_send_large_buffer(ctx,
-                               info,
+        http_send_large_buffer(info,
                                (void *)args->u_buf,
                                args->bytes_len,
                                args->packet_type,
@@ -787,8 +786,7 @@ __obi_protocol_http(struct pt_regs *ctx, unsigned char *(*tp_loop_fn)(unsigned c
             bpf_probe_read(&info->buf[buf_off], 1, (void *)args->u_buf);
         }
 
-        http_send_large_buffer(ctx,
-                               info,
+        http_send_large_buffer(info,
                                (void *)args->u_buf,
                                args->bytes_len,
                                args->packet_type,

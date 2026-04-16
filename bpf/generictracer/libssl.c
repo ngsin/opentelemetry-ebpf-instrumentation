@@ -260,15 +260,15 @@ int BPF_UPROBE(obi_uprobe_ssl_shutdown, void *s) {
         http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &s_conn->p_conn);
         if (info && !info->submitted) {
             if (http_info_complete(info)) {
-                finish_http(ctx, info, &s_conn->p_conn);
+                finish_http(info, &s_conn->p_conn);
             } else {
                 // The request never got a response — force-finish it
                 // so it doesn't leak in the map.
-                force_finish_http(ctx, info, &s_conn->p_conn);
+                force_finish_http(info, &s_conn->p_conn);
             }
         }
         // Clean up already-submitted entries (trace cleanup).
-        finish_possible_delayed_tls_http_request(ctx, &s_conn->p_conn, s);
+        finish_possible_delayed_tls_http_request(&s_conn->p_conn, s);
         bpf_map_delete_elem(&active_ssl_connections, &s_conn->p_conn);
     }
 
