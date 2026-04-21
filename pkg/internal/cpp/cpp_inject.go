@@ -30,6 +30,10 @@ import (
 
 const (
 	cppAgentEmbedPlaceholder = "PLACEHOLDER"
+
+	HostAgentDir    = "/var/lib/obi"
+	HostAgentPath   = "/var/lib/obi/obi-cpp-agent.so"
+	HostAgentConfig = "/var/lib/obi/obi-cpp-config"
 )
 
 // Aliases for testing.
@@ -356,4 +360,89 @@ func namespacePID(hostPID app.PID) (app.PID, error) {
 	}
 
 	return 0, fmt.Errorf("NSpid not found in %s", statusPath)
+}
+
+// EnsureCppAgentOnHost 将内嵌的 agent.so 解压到 /var/lib/obi/，
+// 并为 LD_PRELOAD 加载的进程写入共享配置文件。
+// 幂等：若 agent.so 的 sha256 与已有文件一致则跳过写入。
+// 当 hostPath /var/lib/obi 已挂载时，在 OBI 启动时调用。
+func EnsureCppAgentOnHost(cfg *obi.Config) error {
+	if len(EmbeddedCppAgentBytes) == 0 ||
+		strings.TrimSpace(string(EmbeddedCppAgentBytes)) == cppAgentEmbedPlaceholder {
+		return errors.New("embedded OBI C++ agent artifact is missing")
+	}
+
+	if err := os.MkdirAll(HostAgentDir, 0755); err != nil {
+		return fmt.Errorf("creating %s: %w", HostAgentDir, err)
+	}
+
+	// 检查已有文件是否匹配（幂等）
+	checksum := sha256.Sum256(EmbeddedCppAgentBytes)
+	if info, err := os.Stat(HostAgentPath); err == nil {
+		if info.Size() == int64(len(EmbeddedCppAgentBytes)) {
+			existing, err := os.ReadFile(HostAgentPath)
+			if err == nil {
+				existingSum := sha256.Sum256(existing)
+				if existingSum == checksum {
+					slog.Info("obi-cpp-agent.so already up to date on host", "path", HostAgentPath)
+					return writeHostConfig(cfg)
+				}
+			}
+		}
+	}
+
+	// 通过临时文件 + 重命名原子写入 agent.so
+	tmpFile, err := os.CreateTemp(HostAgentDir, "obi-cpp-agent-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp agent file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+	}()
+
+	if _, err := tmpFile.Write(EmbeddedCppAgentBytes); err != nil {
+		return fmt.Errorf("writing agent.so: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("closing agent.so: %w", err)
+	}
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		return fmt.Errorf("chmod agent.so: %w", err)
+	}
+	if err := renameFile(tmpPath, HostAgentPath); err != nil {
+		return fmt.Errorf("renaming agent.so: %w", err)
+	}
+
+	slog.Info("extracted obi-cpp-agent.so to host", "path", HostAgentPath)
+	return writeHostConfig(cfg)
+}
+
+// writeHostConfig 为 LD_PRELOAD 进程写入 /var/lib/obi/obi-cpp-config。
+// 使用固定标志位：debug + curl_hook + https_server_tls_hook。
+// BPF map 路径使用配置中的 BPFFSPath。
+func writeHostConfig(cfg *obi.Config) error {
+	var flags uint32
+	if cfg.CPP.Debug {
+		flags |= 1 // OBI_CFG_DEBUG
+	}
+	flags |= 2  // OBI_CFG_CURL_HOOK（始终启用，用于客户端 traceparent 注入）
+	flags |= 16 // OBI_CFG_HTTP_SERVER_TLS_HOOK（始终启用，用于入站 traceparent）
+
+	bpfMapPath := path.Join(cfg.EBPF.BPFFSPath, "otel", "traces_ctx_v1")
+	incomingTraceMapPath := path.Join(cfg.EBPF.BPFFSPath, "otel", "incoming_trace_map")
+
+	// socket_path 为空（LD_PRELOAD 模式下不导出 span）
+	// host_pid 为 0（不使用；BPF key 使用进程自身的宿主 TID）
+	content := fmt.Sprintf(
+		"socket_path=\nflags=%d\nbpf_map_path=%s\nincoming_trace_map_path=%s\nhost_pid=0\n",
+		flags, bpfMapPath, incomingTraceMapPath,
+	)
+
+	if err := os.WriteFile(HostAgentConfig, []byte(content), 0644); err != nil {
+		return fmt.Errorf("writing host config: %w", err)
+	}
+	slog.Info("wrote obi-cpp-config to host", "path", HostAgentConfig, "flags", flags)
+	return nil
 }
