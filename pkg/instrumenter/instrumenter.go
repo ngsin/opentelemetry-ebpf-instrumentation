@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"text/template"
 
 	"golang.org/x/sync/errgroup"
 
 	"go.opentelemetry.io/obi/pkg/appolly/meta"
+	"go.opentelemetry.io/obi/pkg/internal/cpp"
 	"go.opentelemetry.io/obi/pkg/docker"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	"go.opentelemetry.io/obi/pkg/export/connector"
@@ -81,6 +83,16 @@ func RunWithContextInfo(
 
 func setupAppO11y(ctx context.Context, ctxInfo *global.ContextInfo, config *obi.Config) error {
 	slog.Info("starting Application Observability mode")
+
+	// 将 agent.so 解压到 /var/lib/obi/ 以用于 LD_PRELOAD 注入。
+	// 此操作是幂等的，即使同时启用了 ptrace 注入也可安全调用。
+	// 仅当 /var/lib/obi 已挂载时才执行（os.Stat 守卫）。
+	if _, err := os.Stat(cpp.HostAgentDir); err == nil {
+		if err := cpp.EnsureCppAgentOnHost(config); err != nil {
+			slog.Warn("failed to extract cpp agent to host path, LD_PRELOAD injection unavailable",
+				"error", err, "path", cpp.HostAgentDir)
+		}
+	}
 
 	instr, err := appolly.New(ctx, ctxInfo, config)
 	if err != nil {
