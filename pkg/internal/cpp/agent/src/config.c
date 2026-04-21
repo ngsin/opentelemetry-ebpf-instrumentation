@@ -26,10 +26,17 @@ int obi_config_read(struct obi_config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->pid = (uint32_t)getpid();
 
-    /* Build config file path: /tmp/.obi-cpp-config-<pid> */
+    /* 优先尝试每进程路径（ptrace 注入模式） */
     snprintf(path, sizeof(path), "/tmp/.obi-cpp-config-%u", cfg->pid);
-
     fp = fopen(path, "r");
+
+    /* 回退：LD_PRELOAD 注入模式的固定路径 */
+    if (!fp) {
+        strncpy(path, "/var/lib/obi/obi-cpp-config", sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+        fp = fopen(path, "r");
+    }
+
     if (!fp) {
         return -1;
     }
