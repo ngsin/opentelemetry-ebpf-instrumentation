@@ -79,5 +79,15 @@ int obi_config_read(struct obi_config *cfg) {
     }
 
     fclose(fp);
+
+    /*
+     * LD_PRELOAD 模式下 host_pid=0（config 中不写具体值，由进程自己获取）。
+     * agent.so 在目标进程内运行，所以 getpid() 直接返回宿主命名空间 PID。
+     * 用它来构造正确的 traces_ctx_v1 BPF map 键：(host_pid << 32) | ns_tid。
+     */
+    if (cfg->host_pid == 0) {
+        cfg->host_pid = cfg->pid;
+    }
+
     return 0;
 }
